@@ -1,85 +1,159 @@
-# Gemini Fallback Indexing Report
+# Offline-First Video Chapter Indexer
 
-## Purpose
+An offline-first Python utility to index local video files, transcribe speech natively using `faster-whisper`, detect semantic topic shifts using the Google GenAI Gemini API, and display them as a clean, chronological "Key Moments" timeline.
 
-This report explains how the project creates video indexing when **`GEMINI_API_KEY` is not provided**.
+---
 
-## Short Answer
+## Architecture & How It Works
 
-If Gemini is unavailable, the app does **not stop**. It automatically falls back to a local chunking method that splits the transcript into simple time-based blocks.
+The indexing pipeline processes local video files through the following stages:
 
-## Where This Happens
+```
+[Local Video] ──► [FFmpeg Extraction] ──► [Local Whisper Transcription]
+                                                      │
+[SQLite Database] ◄── [Segment Mapper] ◄── [Gemini API] ◄── [Saved Transcript Text File]
+```
 
-The fallback logic is in:
+1. **Fingerprinting & De-duplication (`src/indexer.py`):**
+   Generates a fast, deterministic SHA-256 fingerprint based on file path, size, and modification time to index videos uniquely.
 
-- [`src/indexer.py`](./src/indexer.py)
+2. **Audio Extraction (`src/extractor.py`):**
+   Uses `ffmpeg` via Python's `subprocess` to extract audio from video as a Whisper-optimized 16kHz mono MP3.
 
-The key function is:
+3. **Native Speech-to-Text (`src/transcriber.py`):**
+   Runs a local `faster-whisper` (`base` model, quantized to 8-bit `int8` on CPU) to run transcribing locally without sending audio data over the network.
 
-- `chunk_semantically_with_gemini(...)`
+4. **Transcript Archival (`src/indexer.py`):**
+   Saves a detailed dialogue transcript formatted as `[MM:SS -> MM:SS] dialogue line` into a centralized `transcripts/` directory inside the project root.
 
-## What Happens Without a Gemini API Key
+5. **Gemini Topic Segmentation (`src/indexer.py`):**
+   Reads the saved transcript file and feeds it to `gemini-1.5-flash` using the modern `google-genai` SDK. Gemini acts as a Video Metadata Engineer, parsing the time ranges, determining topic boundaries, and returning structured JSON:
+   ```json
+   [
+     {"start_time": 0.0, "topic": "Introduction"},
+     {"start_time": 65.0, "topic": "Installation Guide"}
+   ]
+   ```
+   *Note: If your `GEMINI_API_KEY` is missing or the request fails, the pipeline falls back gracefully to a local ~60-second sentence-aligned chunker.*
 
-When `GEMINI_API_KEY` is missing or invalid:
+6. **SQLite Storage & Indexing (`src/database.py`):**
+   Reconstructs text blocks by matching Whisper segments into Gemini's topic slots and saves them to a local SQLite database (`data/indexer.db`) with cascading deletions.
 
-1. The app checks whether the Gemini SDK is installed.
-2. It checks whether `GEMINI_API_KEY` exists in the environment.
-3. If the key is missing, the app prints a warning.
-4. It then uses the local fallback function:
-   - `chunk_segments(...)`
+7. **Timeline Moment Display (`main.py`):**
+   Renders chronological Moments timelines and lets you query snippets easily.
 
-## How the Fallback Indexing Works
+---
 
-The fallback does **not use AI topic detection**.
+## Installation & Setup
 
-Instead, it:
+### Prerequisites
 
-1. Reads the Whisper transcript segments.
-2. Groups them into blocks of about **60 seconds**.
-3. Assigns default titles like:
-   - `Section 1`
-   - `Section 2`
-   - `Section 3`
+1. **Python 3.8+**
+2. **FFmpeg:** FFmpeg must be installed on your machine and available in your system `PATH`.
+   - **Windows:** Download from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) and add its `bin` directory to your System Environment variables.
+   - You can also configure a custom path using `FFMPEG_PATH` in your `.env` file.
 
-This gives the video a basic timeline index even without Gemini.
+### Installation Steps
 
-## Transcript Output
+1. **Clone/Open the workspace directory** and install the Python dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-The transcript text file is still created next to the video.
+2. **Setup your environment variables:**
+   Copy `.env.example` to `.env` and fill in your Google Gemini API Key:
+   ```bash
+   cp .env.example .env
+   ```
+   Edit `.env` to include:
+   ```env
+   GEMINI_API_KEY="AIzaSy..."
+   DB_PATH="data/indexer.db"
+   ```
 
-If chapter blocks are available, the file includes:
+---
 
-- an `Index` section
-- chapter headings
-- timestamped transcript lines under each section
+## CLI Usage Guide
 
-If no semantic blocks are available, the file falls back to plain timestamped transcript lines.
+All interactions are executed through the `main.py` entrypoint.
 
-## Example Fallback Behavior
+### 1. Index a Local Video File
+Extracts, transcribes, segments, and indexes:
+```bash
+python main.py index C:\path\to\your\video.mp4
+```
+*Tip: You can pass an optional `-l` or `--language` code to force a specific translation language (e.g., `-l en`).*
 
-Without Gemini:
+During indexing, the dialogue transcript is saved to the project's `transcripts/` directory as:
+`transcripts/<video_id>_<video_basename>_transcript.txt`
 
-- `00:00 - Section 1`
-- `01:00 - Section 2`
-- `02:00 - Section 3`
+### 2. List All Indexed Videos
+Display all videos in the database catalog:
+```bash
+python main.py list
+```
+**Example output:**
+```
+VIDEO ID           | FILE NAME                      | DURATION   | INDEXED AT
+--------------------------------------------------------------------------------
+ca84fc53ba36f8eb   | 3333.mp3                       | 05:14      | 2026-06-04 15:45:10
+```
 
-This is a timing-based index, not a meaning-based chapter split.
+### 3. Show Video Chapters (Key Moments Timeline)
+Displays the generated semantic moments timeline in a professional YouTube-style moments layout:
+```bash
+python main.py show ca84fc53ba36f8eb
+```
+**Example output:**
+```
+Video: 3333.mp3
+ID: ca84fc53ba36f8eb
+Duration: 05:14
+Total Topics: 6
 
-## Important Difference
+TIMESTAMP  | KEY MOMENT TOPIC
+-----------------------------------------------------------------
+ [00:00]   | Introduction and Setup
+ [00:59]   | Installing FFmpeg and Whisper Libraries
+ [01:52]   | Initializing Local WhisperModel
+ [02:48]   | Running Segment boundary checks
+ [03:47]   | Generating JSON boundaries via Gemini
+ [04:56]   | Summary of Execution Results
+```
 
-### With Gemini
+### 4. Search Transcript Snippets
+Searches for keywords across all indexed text blocks for a video, displaying matched topics and highlighting keyword hits:
+```bash
+python main.py search ca84fc53ba36f8eb "Whisper"
+```
+**Example output:**
+```
+Searching for 'Whisper' in '3333.mp3'...
+Found 1 matching block(s):
 
-- The chapter titles are semantic
-- Topics are based on meaning and context
-- Example: `Introduction`, `Grammar`, `Vocabulary`, `Reading`, `Conclusion`
+[01:52 -> 02:48] (Initializing Local WhisperModel)
+  Once the audio file is ready, we initialize the **WHISPER** model locally on our CPU.
+```
 
-### Without Gemini
+### 5. Delete a Video Index
+Wipes a video and all of its associated semantic blocks from the SQLite database:
+```bash
+python main.py delete ca84fc53ba36f8eb
+```
 
-- The chapter titles are generic
-- Blocks are based on time intervals
-- Example: `Section 1`, `Section 2`, `Section 3`
+---
 
-## Conclusion
+## Running Automated Tests
 
-Even without a Gemini API key, the project still creates an indexed transcript.
-It simply uses a **local fallback chunker** instead of AI-based semantic chapter detection.
+To ensure the integrity of database queries, semantic chunking boundaries, and segment mapping calculations, run the unit test suite:
+```bash
+python -m unittest test_indexer.py
+```
+Outputs:
+```
+.........
+----------------------------------------------------------------------
+Ran 9 tests in 0.031s
+
+OK
+```
